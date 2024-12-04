@@ -19,13 +19,14 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime/debug"
 
+	pb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	flags "github.com/jessevdk/go-flags"
-	pb "google.golang.org/genproto/googleapis/spanner/v1"
 )
 
 type globalOptions struct {
@@ -33,17 +34,23 @@ type globalOptions struct {
 }
 
 type spannerOptions struct {
-	ProjectId   string `short:"p" long:"project" env:"SPANNER_PROJECT_ID" description:"(required) GCP Project ID."`
-	InstanceId  string `short:"i" long:"instance" env:"SPANNER_INSTANCE_ID" description:"(required) Cloud Spanner Instance ID"`
-	DatabaseId  string `short:"d" long:"database" env:"SPANNER_DATABASE_ID" description:"(required) Cloud Spanner Database ID."`
-	Execute     string `short:"e" long:"execute" description:"Execute SQL statement and quit."`
-	File        string `short:"f" long:"file" description:"Execute SQL statement from file and quit."`
-	Table       bool   `short:"t" long:"table" description:"Display output in table format for batch mode."`
-	Verbose     bool   `short:"v" long:"verbose" description:"Display verbose output."`
-	Credential  string `long:"credential" description:"Use the specific credential file"`
-	Prompt      string `long:"prompt" description:"Set the prompt to the specified format"`
-	HistoryFile string `long:"history" description:"Set the history file to the specified path"`
-	Priority    string `long:"priority" description:"Set default request priority (HIGH|MEDIUM|LOW)"`
+	ProjectId           string `short:"p" long:"project" env:"SPANNER_PROJECT_ID" description:"(required) GCP Project ID."`
+	InstanceId          string `short:"i" long:"instance" env:"SPANNER_INSTANCE_ID" description:"(required) Cloud Spanner Instance ID"`
+	DatabaseId          string `short:"d" long:"database" env:"SPANNER_DATABASE_ID" description:"(required) Cloud Spanner Database ID."`
+	Execute             string `short:"e" long:"execute" description:"Execute SQL statement and quit."`
+	File                string `short:"f" long:"file" description:"Execute SQL statement from file and quit."`
+	Table               bool   `short:"t" long:"table" description:"Display output in table format for batch mode."`
+	Verbose             bool   `short:"v" long:"verbose" description:"Display verbose output."`
+	Credential          string `long:"credential" description:"Use the specific credential file"`
+	Prompt              string `long:"prompt" description:"Set the prompt to the specified format"`
+	HistoryFile         string `long:"history" description:"Set the history file to the specified path"`
+	Priority            string `long:"priority" description:"Set default request priority (HIGH|MEDIUM|LOW)"`
+	Role                string `long:"role" description:"Use the specific database role"`
+	Endpoint            string `long:"endpoint" description:"Set the Spanner API endpoint (host:port)"`
+	DirectedRead        string `long:"directed-read" description:"Directed read option (replica_location:replica_type). The replicat_type is optional and either READ_ONLY or READ_WRITE"`
+	SkipTLSVerify       bool   `long:"skip-tls-verify" description:"Insecurely skip TLS verify"`
+	ProtoDescriptorFile string `long:"proto-descriptor-file" description:"Path of a file that contains a protobuf-serialized google.protobuf.FileDescriptorSet message to use in this invocation."`
+	Version             bool   `long:"version" description:"Show version of spanner-cli"`
 }
 
 func main() {
@@ -57,6 +64,11 @@ func main() {
 	// use another parser to process environment variable
 	if _, err := flags.NewParser(&gopts, flags.Default).Parse(); err != nil {
 		exitf("Invalid options\n")
+	}
+
+	if gopts.Spanner.Version {
+		fmt.Fprintf(os.Stdout, "%s\n", versionInfo())
+		os.Exit(0)
 	}
 
 	opts := gopts.Spanner
@@ -84,7 +96,28 @@ func main() {
 		}
 	}
 
-	cli, err := NewCli(opts.ProjectId, opts.InstanceId, opts.DatabaseId, opts.Prompt, opts.HistoryFile, cred, os.Stdin, os.Stdout, os.Stderr, opts.Verbose, priority)
+	var directedRead *pb.DirectedReadOptions
+	if opts.DirectedRead != "" {
+		var err error
+		directedRead, err = parseDirectedReadOption(opts.DirectedRead)
+		if err != nil {
+			exitf("Invalid directed read option: %v\n", err)
+		}
+	}
+
+	// Don't need to unmarshal into descriptorpb.FileDescriptorSet because the UpdateDDL API just accepts []byte.
+	var protoDescriptor []byte
+	if opts.ProtoDescriptorFile != "" {
+		var err error
+		protoDescriptor, err = os.ReadFile(opts.ProtoDescriptorFile)
+		if err != nil {
+			exitf("Failed to read proto descriptor file: %v\n", err)
+		}
+	}
+
+	cli, err := NewCli(opts.ProjectId, opts.InstanceId, opts.DatabaseId, opts.Prompt, opts.HistoryFile, cred,
+		os.Stdin, os.Stdout, os.Stderr, opts.Verbose, priority, opts.Role, opts.Endpoint, directedRead,
+		opts.SkipTLSVerify, protoDescriptor)
 	if err != nil {
 		exitf("Failed to connect to Spanner: %v", err)
 	}
@@ -93,13 +126,13 @@ func main() {
 	if opts.Execute != "" {
 		input = opts.Execute
 	} else if opts.File == "-" {
-		b, err := ioutil.ReadAll(os.Stdin)
+		b, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			exitf("Read from stdin failed: %v", err)
 		}
 		input = string(b)
 	} else if opts.File != "" {
-		b, err := ioutil.ReadFile(opts.File)
+		b, err := os.ReadFile(opts.File)
 		if err != nil {
 			exitf("Read from file %v failed: %v", opts.File, err)
 		}
@@ -156,13 +189,13 @@ func readCredentialFile(filepath string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ioutil.ReadAll(f)
+	return io.ReadAll(f)
 }
 
 func readStdin() (string, error) {
 	stat, _ := os.Stdin.Stat()
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
-		b, err := ioutil.ReadAll(os.Stdin)
+		b, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return "", err
 		}
@@ -170,4 +203,12 @@ func readStdin() (string, error) {
 	} else {
 		return "", nil
 	}
+}
+
+func versionInfo() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "(devel)"
+	}
+	return info.Main.Version
 }

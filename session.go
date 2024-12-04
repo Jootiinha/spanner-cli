@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,10 +29,10 @@ import (
 	"google.golang.org/grpc/codes"
 
 	adminapi "cloud.google.com/go/spanner/admin/database/apiv1"
-	pb "google.golang.org/genproto/googleapis/spanner/v1"
+	pb "cloud.google.com/go/spanner/apiv1/spannerpb"
 )
 
-var clientConfig = spanner.ClientConfig{
+var defaultClientConfig = spanner.ClientConfig{
 	SessionPoolConfig: spanner.SessionPoolConfig{
 		MinOpened: 1,
 		MaxOpened: 10, // FIXME: integration_test requires more than a single session
@@ -51,10 +52,13 @@ type Session struct {
 	databaseId      string
 	client          *spanner.Client
 	adminClient     *adminapi.DatabaseAdminClient
+	clientConfig    spanner.ClientConfig
 	clientOpts      []option.ClientOption
 	defaultPriority pb.RequestOptions_Priority
+	directedRead    *pb.DirectedReadOptions
 	tc              *transactionContext
 	tcMutex         sync.Mutex // Guard a critical section for transaction.
+	protoDescriptor []byte
 }
 
 type transactionContext struct {
@@ -65,11 +69,14 @@ type transactionContext struct {
 	roTxn         *spanner.ReadOnlyTransaction
 }
 
-func NewSession(projectId string, instanceId string, databaseId string, priority pb.RequestOptions_Priority, opts ...option.ClientOption) (*Session, error) {
+func NewSession(projectId string, instanceId string, databaseId string, priority pb.RequestOptions_Priority, role string, directedRead *pb.DirectedReadOptions,
+	protoDescriptor []byte, opts ...option.ClientOption) (*Session, error) {
 	ctx := context.Background()
 	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectId, instanceId, databaseId)
+	clientConfig := defaultClientConfig
+	clientConfig.DatabaseRole = role
+	clientConfig.DirectedReadOptions = directedRead
 	opts = append(opts, defaultClientOpts...)
-
 	client, err := spanner.NewClientWithConfig(ctx, dbPath, clientConfig, opts...)
 	if err != nil {
 		return nil, err
@@ -89,9 +96,12 @@ func NewSession(projectId string, instanceId string, databaseId string, priority
 		instanceId:      instanceId,
 		databaseId:      databaseId,
 		client:          client,
+		clientConfig:    clientConfig,
 		clientOpts:      opts,
 		adminClient:     adminClient,
 		defaultPriority: priority,
+		directedRead:    directedRead,
+		protoDescriptor: protoDescriptor,
 	}
 	go session.startHeartbeat()
 
@@ -235,7 +245,7 @@ func (s *Session) RunQuery(ctx context.Context, stmt spanner.Statement) (*spanne
 }
 
 // RunAnalyzeQuery analyzes a statement either on the running transaction or on the temporal read-only transaction.
-func (s *Session) RunAnalyzeQuery(ctx context.Context, stmt spanner.Statement) (*pb.QueryPlan, error) {
+func (s *Session) RunAnalyzeQuery(ctx context.Context, stmt spanner.Statement) (*pb.QueryPlan, *pb.ResultSetMetadata, error) {
 	mode := pb.ExecuteSqlRequest_PLAN
 	opts := spanner.QueryOptions{
 		Mode:     &mode,
@@ -244,17 +254,20 @@ func (s *Session) RunAnalyzeQuery(ctx context.Context, stmt spanner.Statement) (
 	iter, _ := s.runQueryWithOptions(ctx, stmt, opts)
 
 	// Need to read rows from iterator to get the query plan.
-	iter.Do(func(r *spanner.Row) error {
+	err := iter.Do(func(r *spanner.Row) error {
 		return nil
 	})
-	if iter.QueryPlan == nil {
-		return nil, errors.New("query plan unavailable")
+	if err != nil {
+		return nil, nil, err
 	}
-	return iter.QueryPlan, nil
+	return iter.QueryPlan, iter.Metadata, nil
 }
 
 func (s *Session) runQueryWithOptions(ctx context.Context, stmt spanner.Statement, opts spanner.QueryOptions) (*spanner.RowIterator, *spanner.ReadOnlyTransaction) {
 	if s.InReadWriteTransaction() {
+		// The current Go Spanner client library does not apply client-level directed read options to read-write transactions.
+		// Therefore, we explicitly set query-level options here to fail the query during a read-write transaction.
+		opts.DirectedReadOptions = s.clientConfig.DirectedReadOptions
 		opts.RequestTag = s.tc.tag
 		iter := s.tc.rwTxn.QueryWithOptions(ctx, stmt, opts)
 		s.tc.sendHeartbeat = true
@@ -271,18 +284,31 @@ func (s *Session) runQueryWithOptions(ctx context.Context, stmt spanner.Statemen
 
 // RunUpdate executes a DML statement on the running read-write transaction.
 // It returns error if there is no running read-write transaction.
-func (s *Session) RunUpdate(ctx context.Context, stmt spanner.Statement) (int64, error) {
+// useUpdate flag enforce to use Update function internally and disable `THEN RETURN` result printing.
+func (s *Session) RunUpdate(ctx context.Context, stmt spanner.Statement, useUpdate bool) ([]Row, []string, int64, *pb.ResultSetMetadata, error) {
 	if !s.InReadWriteTransaction() {
-		return 0, errors.New("read-write transaction is not running")
+		return nil, nil, 0, nil, errors.New("read-write transaction is not running")
 	}
 
 	opts := spanner.QueryOptions{
 		Priority:   s.currentPriority(),
 		RequestTag: s.tc.tag,
 	}
-	rowCount, err := s.tc.rwTxn.UpdateWithOptions(ctx, stmt, opts)
+
+	// Workaround: Usually, we can execute DMLs using Query(ExecuteStreamingSql RPC),
+	// but spannertest doesn't support DMLs execution using ExecuteStreamingSql RPC.
+	// It enforces to use ExecuteSql RPC.
+	if useUpdate {
+		rowCount, err := s.tc.rwTxn.UpdateWithOptions(ctx, stmt, opts)
+		s.tc.sendHeartbeat = true
+		return nil, nil, rowCount, nil, err
+	}
+
+	rowIter := s.tc.rwTxn.QueryWithOptions(ctx, stmt, opts)
+	defer rowIter.Stop()
+	result, columnNames, err := parseQueryResult(rowIter)
 	s.tc.sendHeartbeat = true
-	return rowCount, err
+	return result, columnNames, rowIter.RowCount, rowIter.Metadata, err
 }
 
 func (s *Session) Close() {
@@ -325,7 +351,7 @@ func (s *Session) DatabaseExists() (bool, error) {
 // RecreateClient closes the current client and creates a new client for the session.
 func (s *Session) RecreateClient() error {
 	ctx := context.Background()
-	c, err := spanner.NewClientWithConfig(ctx, s.DatabasePath(), clientConfig, s.clientOpts...)
+	c, err := spanner.NewClientWithConfig(ctx, s.DatabasePath(), s.clientConfig, s.clientOpts...)
 	if err != nil {
 		return err
 	}
@@ -373,4 +399,35 @@ func heartbeat(txn *spanner.ReadWriteStmtBasedTransaction, priority pb.RequestOp
 	defer iter.Stop()
 	_, err := iter.Next()
 	return err
+}
+
+func parseDirectedReadOption(directedReadOptionText string) (*pb.DirectedReadOptions, error) {
+	directedReadOption := strings.Split(directedReadOptionText, ":")
+	if len(directedReadOption) > 2 {
+		return nil, fmt.Errorf("directed read option must be in the form of <replica_location>:<replica_type>, but got %q", directedReadOptionText)
+	}
+
+	replicaSelection := pb.DirectedReadOptions_ReplicaSelection{
+		Location: directedReadOption[0],
+	}
+
+	if len(directedReadOption) == 2 {
+		switch strings.ToUpper(directedReadOption[1]) {
+		case "READ_ONLY":
+			replicaSelection.Type = pb.DirectedReadOptions_ReplicaSelection_READ_ONLY
+		case "READ_WRITE":
+			replicaSelection.Type = pb.DirectedReadOptions_ReplicaSelection_READ_WRITE
+		default:
+			return nil, fmt.Errorf("<replica_type> must be either READ_WRITE or READ_ONLY, but got %q", directedReadOption[1])
+		}
+	}
+
+	return &pb.DirectedReadOptions{
+		Replicas: &pb.DirectedReadOptions_IncludeReplicas_{
+			IncludeReplicas: &pb.DirectedReadOptions_IncludeReplicas{
+				ReplicaSelections:    []*pb.DirectedReadOptions_ReplicaSelection{&replicaSelection},
+				AutoFailoverDisabled: true,
+			},
+		},
+	}, nil
 }

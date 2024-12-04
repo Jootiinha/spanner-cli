@@ -24,7 +24,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	pb "google.golang.org/genproto/googleapis/spanner/v1"
+	pb "cloud.google.com/go/spanner/apiv1/spannerpb"
 )
 
 func TestBuildStatement(t *testing.T) {
@@ -51,6 +51,11 @@ func TestBuildStatement(t *testing.T) {
 			want:  &SelectStatement{Query: "SELECT\n*\nFROM t1"},
 		},
 		{
+			desc:  "SELECT statement with comment",
+			input: "SELECT 0x1/**/A",
+			want:  &SelectStatement{Query: "SELECT 0x1/**/A"},
+		},
+		{
 			desc:  "WITH statement",
 			input: "WITH sub AS (SELECT 1) SELECT * FROM sub",
 			want:  &SelectStatement{Query: "WITH sub AS (SELECT 1) SELECT * FROM sub"},
@@ -60,6 +65,21 @@ func TestBuildStatement(t *testing.T) {
 			desc:  "SELECT statement with statement hint",
 			input: "@{USE_ADDITIONAL_PARALLELISM=TRUE} SELECT * FROM t1",
 			want:  &SelectStatement{Query: "@{USE_ADDITIONAL_PARALLELISM=TRUE} SELECT * FROM t1"},
+		},
+		{
+			desc:  "SELECT statement in parenthesis",
+			input: "(SELECT * FROM t1)",
+			want:  &SelectStatement{Query: "(SELECT * FROM t1)"},
+		},
+		{
+			desc:  "WITH statement in parenthesis",
+			input: "(WITH sub AS (SELECT 1) SELECT * FROM sub)",
+			want:  &SelectStatement{Query: "(WITH sub AS (SELECT 1) SELECT * FROM sub)"},
+		},
+		{
+			desc:  "SELECT statement in parenthesis with statement hint",
+			input: "@{USE_ADDITIONAL_PARALLELISM=TRUE} (SELECT * FROM t1)",
+			want:  &SelectStatement{Query: "@{USE_ADDITIONAL_PARALLELISM=TRUE} (SELECT * FROM t1)"},
 		},
 		{
 			desc:  "CREATE DATABASE statement",
@@ -85,6 +105,11 @@ func TestBuildStatement(t *testing.T) {
 			desc:  "CREATE TABLE statement",
 			input: "CREATE TABLE t1 (id INT64 NOT NULL) PRIMARY KEY (id)",
 			want:  &DdlStatement{Ddl: "CREATE TABLE t1 (id INT64 NOT NULL) PRIMARY KEY (id)"},
+		},
+		{
+			desc:  "RENAME TABLE statement",
+			input: "RENAME TABLE t1 TO t2, t3 TO t4",
+			want:  &DdlStatement{Ddl: "RENAME TABLE t1 TO t2, t3 TO t4"},
 		},
 		{
 			desc:  "ALTER TABLE statement",
@@ -204,17 +229,22 @@ func TestBuildStatement(t *testing.T) {
 		{
 			desc:  "EXPLAIN INSERT statement",
 			input: "EXPLAIN INSERT INTO t1 (id, name) VALUES (1, 'yuki')",
-			want:  &ExplainDmlStatement{Dml: "INSERT INTO t1 (id, name) VALUES (1, 'yuki')"},
+			want:  &ExplainStatement{Explain: "INSERT INTO t1 (id, name) VALUES (1, 'yuki')", IsDML: true},
 		},
 		{
 			desc:  "EXPLAIN UPDATE statement",
 			input: "EXPLAIN UPDATE t1 SET name = hello WHERE id = 1",
-			want:  &ExplainDmlStatement{Dml: "UPDATE t1 SET name = hello WHERE id = 1"},
+			want:  &ExplainStatement{Explain: "UPDATE t1 SET name = hello WHERE id = 1", IsDML: true},
 		},
 		{
 			desc:  "EXPLAIN DELETE statement",
 			input: "EXPLAIN DELETE FROM t1 WHERE id = 1",
-			want:  &ExplainDmlStatement{Dml: "DELETE FROM t1 WHERE id = 1"},
+			want:  &ExplainStatement{Explain: "DELETE FROM t1 WHERE id = 1", IsDML: true},
+		},
+		{
+			desc:  "DESCRIBE DELETE statement",
+			input: "DESCRIBE DELETE FROM t1 WHERE id = 1",
+			want:  &DescribeStatement{Statement: "DELETE FROM t1 WHERE id = 1", IsDML: true},
 		},
 		{
 			desc:  "EXPLAIN ANALYZE INSERT statement",
@@ -413,6 +443,16 @@ func TestBuildStatement(t *testing.T) {
 			want:  &UseStatement{Database: "my-database"},
 		},
 		{
+			desc:  "USE statement with role",
+			input: "USE database2 ROLE role2",
+			want:  &UseStatement{Database: "database2", Role: "role2"},
+		},
+		{
+			desc:  "USE statement with quoted identifier",
+			input: "USE `my-database` ROLE `my-role`",
+			want:  &UseStatement{Database: "my-database", Role: "my-role"},
+		},
+		{
 			desc:  "SHOW DATABASES statement",
 			input: "SHOW DATABASES",
 			want:  &ShowDatabasesStatement{},
@@ -421,6 +461,11 @@ func TestBuildStatement(t *testing.T) {
 			desc:  "SHOW CREATE TABLE statement",
 			input: "SHOW CREATE TABLE t1",
 			want:  &ShowCreateTableStatement{Table: "t1"},
+		},
+		{
+			desc:  "SHOW CREATE TABLE statement with a named schema",
+			input: "SHOW CREATE TABLE sch1.t1",
+			want:  &ShowCreateTableStatement{Schema: "sch1", Table: "t1"},
 		},
 		{
 			desc:  "SHOW CREATE TABLE statement with quoted identifier",
@@ -433,9 +478,24 @@ func TestBuildStatement(t *testing.T) {
 			want:  &ShowTablesStatement{},
 		},
 		{
+			desc:  "SHOW TABLES statement with schema",
+			input: "SHOW TABLES sch1",
+			want:  &ShowTablesStatement{Schema: "sch1"},
+		},
+		{
+			desc:  "SHOW TABLES statement with quoted schema",
+			input: "SHOW TABLES `sch1`",
+			want:  &ShowTablesStatement{Schema: "sch1"},
+		},
+		{
 			desc:  "SHOW INDEX statement",
 			input: "SHOW INDEX FROM t1",
 			want:  &ShowIndexStatement{Table: "t1"},
+		},
+		{
+			desc:  "SHOW INDEX statement with a named schema",
+			input: "SHOW INDEX FROM sch1.t1",
+			want:  &ShowIndexStatement{Schema: "sch1", Table: "t1"},
 		},
 		{
 			desc:  "SHOW INDEXES statement",
@@ -458,6 +518,11 @@ func TestBuildStatement(t *testing.T) {
 			want:  &ShowColumnsStatement{Table: "t1"},
 		},
 		{
+			desc:  "SHOW COLUMNS statement with a named schema",
+			input: "SHOW COLUMNS FROM sch1.t1",
+			want:  &ShowColumnsStatement{Schema: "sch1", Table: "t1"},
+		},
+		{
 			desc:  "SHOW COLUMNS statement with quoted identifier",
 			input: "SHOW COLUMNS FROM `TABLE`",
 			want:  &ShowColumnsStatement{Table: "TABLE"},
@@ -478,14 +543,39 @@ func TestBuildStatement(t *testing.T) {
 			want:  &ExplainStatement{Explain: "WITH t1 AS (SELECT 1) SELECT * FROM t1"},
 		},
 		{
-			desc:  "DESCRIBE SELECT statement",
-			input: "DESCRIBE SELECT * FROM t1",
-			want:  &ExplainStatement{Explain: "SELECT * FROM t1"},
+			desc:  "GRAPH statement",
+			input: "GRAPH FinGraph MATCH (n) RETURN LABELS(n) AS label, n.id",
+			want:  &SelectStatement{Query: "GRAPH FinGraph MATCH (n) RETURN LABELS(n) AS label, n.id"},
 		},
 		{
-			desc:  "DESC SELECT statement",
-			input: "DESC SELECT * FROM t1",
-			want:  &ExplainStatement{Explain: "SELECT * FROM t1"},
+			desc:  "EXPLAIN GRAPH statement",
+			input: "EXPLAIN GRAPH FinGraph MATCH (n) RETURN LABELS(n) AS label, n.id",
+			want:  &ExplainStatement{Explain: "GRAPH FinGraph MATCH (n) RETURN LABELS(n) AS label, n.id"},
+		},
+		{
+			desc:  "EXPLAIN ANALYZE GRAPH statement",
+			input: "EXPLAIN ANALYZE GRAPH FinGraph MATCH (n) RETURN LABELS(n) AS label, n.id",
+			want:  &ExplainAnalyzeStatement{Query: "GRAPH FinGraph MATCH (n) RETURN LABELS(n) AS label, n.id"},
+		},
+		{
+			desc:  "DESCRIBE SELECT statement",
+			input: "DESCRIBE SELECT * FROM t1",
+			want:  &DescribeStatement{Statement: "SELECT * FROM t1"},
+		},
+		{
+			desc:  "Stored system procedures",
+			input: `CALL cancel_query("1234567890123456789")`,
+			want:  &SelectStatement{Query: `CALL cancel_query("1234567890123456789")`},
+		},
+		{
+			desc:  "EXPLAIN Stored system procedures",
+			input: `EXPLAIN CALL cancel_query("1234567890123456789")`,
+			want:  &ExplainStatement{Explain: `CALL cancel_query("1234567890123456789")`},
+		},
+		{
+			desc:  "EXPLAIN ANALYZE Stored system procedures",
+			input: `EXPLAIN ANALYZE CALL cancel_query("1234567890123456789")`,
+			want:  &ExplainAnalyzeStatement{Query: `CALL cancel_query("1234567890123456789")`},
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
@@ -533,10 +623,11 @@ func TestBuildStatement(t *testing.T) {
 
 func TestIsCreateTableDDL(t *testing.T) {
 	for _, tt := range []struct {
-		desc  string
-		ddl   string
-		table string
-		want  bool
+		desc   string
+		ddl    string
+		schema string
+		table  string
+		want   bool
 	}{
 		{
 			desc:  "exact match",
@@ -576,8 +667,90 @@ func TestIsCreateTableDDL(t *testing.T) {
 		},
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
-			if got := isCreateTableDDL(tt.ddl, tt.table); got != tt.want {
+			if got := isCreateTableDDL(tt.ddl, tt.schema, tt.table); got != tt.want {
 				t.Errorf("isCreateTableDDL(%q, %q) = %v, but want %v", tt.ddl, tt.table, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractSchemaAndTable(t *testing.T) {
+	for _, tt := range []struct {
+		desc   string
+		input  string
+		schema string
+		table  string
+	}{
+		{
+			desc:   "raw table",
+			input:  "table",
+			schema: "",
+			table:  "table",
+		},
+		{
+			desc:   "quoted table",
+			input:  "`table`",
+			schema: "",
+			table:  "table",
+		},
+		{
+			desc:   "FQN",
+			input:  "schema.table",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "FQN with spaces",
+			input:  "schema . table",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "FQN, both schema and table are quoted",
+			input:  "`schema`.`table`",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "FQN with spaces, both schema and table are quoted",
+			input:  "`schema` . `table`",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "FQN, only schema is quoted",
+			input:  "`schema`.table",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "FQN with spaces, only schema is quoted",
+			input:  "`schema` . table",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "FQN, only table is quoted",
+			input:  "schema.`table`",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "FQN with spaces, only table is quoted",
+			input:  "schema . `table`",
+			schema: "schema",
+			table:  "table",
+		},
+		{
+			desc:   "whole quoted FQN",
+			input:  "`schema.table`",
+			schema: "schema",
+			table:  "table",
+		},
+	} {
+		t.Run(tt.desc, func(t *testing.T) {
+			if schema, table := extractSchemaAndTable(tt.input); schema != tt.schema || table != tt.table {
+				t.Errorf("extractSchemaAndTable(%q) = (%v, %v), but want (%v, %v)", tt.input, schema, table, tt.schema, tt.table)
 			}
 		})
 	}

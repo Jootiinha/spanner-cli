@@ -20,14 +20,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"testing"
 	"time"
 
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/chzyer/readline"
 	"github.com/google/go-cmp/cmp"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 )
 
 type nopCloser struct {
@@ -40,36 +39,75 @@ func (n *nopCloser) Close() error {
 
 func TestBuildCommands(t *testing.T) {
 	tests := []struct {
-		Input    string
-		Expected []*command
+		Input       string
+		Expected    []*command
+		ExpectError bool
 	}{
-		{`SELECT * FROM t1;`, []*command{{&SelectStatement{"SELECT * FROM t1"}, false}}},
-		{`CREATE TABLE t1;`, []*command{{&BulkDdlStatement{[]string{"CREATE TABLE t1"}}, false}}},
-		{`CREATE TABLE t1(pk INT64) PRIMARY KEY(pk); ALTER TABLE t1 ADD COLUMN col INT64; CREATE INDEX i1 ON t1(col); DROP INDEX i1; DROP TABLE t1;`,
-			[]*command{{&BulkDdlStatement{[]string{
+		{Input: `SELECT * FROM t1;`, Expected: []*command{{&SelectStatement{"SELECT * FROM t1"}, false}}},
+		{Input: `CREATE TABLE t1;`, Expected: []*command{{&BulkDdlStatement{[]string{"CREATE TABLE t1"}}, false}}},
+		{
+			Input: `CREATE TABLE t1(pk INT64) PRIMARY KEY(pk); ALTER TABLE t1 ADD COLUMN col INT64; CREATE INDEX i1 ON t1(col); DROP INDEX i1; DROP TABLE t1;`,
+			Expected: []*command{{&BulkDdlStatement{[]string{
 				"CREATE TABLE t1(pk INT64) PRIMARY KEY(pk)",
 				"ALTER TABLE t1 ADD COLUMN col INT64",
 				"CREATE INDEX i1 ON t1(col)",
 				"DROP INDEX i1",
 				"DROP TABLE t1",
-			}}, false}}},
-		{`CREATE TABLE t1(pk INT64) PRIMARY KEY(pk);
+			}}, false}},
+		},
+		{
+			Input: `CREATE TABLE t1(pk INT64) PRIMARY KEY(pk);
                 CREATE TABLE t2(pk INT64) PRIMARY KEY(pk);
                 SELECT * FROM t1\G
                 DROP TABLE t1;
                 DROP TABLE t2;
                 SELECT 1;`,
-			[]*command{
+			Expected: []*command{
 				{&BulkDdlStatement{[]string{"CREATE TABLE t1(pk INT64) PRIMARY KEY(pk)", "CREATE TABLE t2(pk INT64) PRIMARY KEY(pk)"}}, false},
 				{&SelectStatement{"SELECT * FROM t1"}, true},
 				{&BulkDdlStatement{[]string{"DROP TABLE t1", "DROP TABLE t2"}}, false},
 				{&SelectStatement{"SELECT 1"}, false},
-			}},
+			},
+		},
+		{
+			Input: `
+			CREATE TABLE t1(pk INT64 /* NOT NULL*/, col INT64) PRIMARY KEY(pk);
+			INSERT t1(pk/*, col*/) VALUES(1/*, 2*/);
+			UPDATE t1 SET col = /* pk + */ col + 1 WHERE TRUE;
+			DELETE t1 WHERE TRUE /* AND pk = 1 */;
+			SELECT 0x1/**/A`,
+			Expected: []*command{
+				{&BulkDdlStatement{[]string{"CREATE TABLE t1(pk INT64  , col INT64) PRIMARY KEY(pk)"}}, false},
+				{&DmlStatement{"INSERT t1(pk/*, col*/) VALUES(1/*, 2*/)"}, false},
+				{&DmlStatement{"UPDATE t1 SET col = /* pk + */ col + 1 WHERE TRUE"}, false},
+				{&DmlStatement{"DELETE t1 WHERE TRUE /* AND pk = 1 */"}, false},
+				{&SelectStatement{"SELECT 0x1/**/A"}, false},
+			},
+		},
+		{
+			// spanner-cli don't permit empty statements.
+			Input:       `SELECT 1; /* comment */; SELECT 2`,
+			ExpectError: true,
+		},
+		{
+			Input:       `SELECT 1; /* comment 1 */; /* comment 2 */`,
+			ExpectError: true,
+		},
+		{
+			// A comment after the last semicolon is permitted.
+			Input: `SELECT 1; /* comment */`,
+			Expected: []*command{
+				{&SelectStatement{"SELECT 1"}, false},
+			},
+		},
 	}
 
 	for _, test := range tests {
 		got, err := buildCommands(test.Input)
-		if err != nil {
+		if test.ExpectError && err == nil {
+			t.Errorf("expect error but not error, input: %v", test.Input)
+		}
+		if !test.ExpectError && err != nil {
 			t.Errorf("err: %v, input: %v", err, test.Input)
 		}
 
@@ -90,32 +128,36 @@ func TestReadInteractiveInput(t *testing.T) {
 			desc:  "single line",
 			input: "SELECT 1;\n",
 			want: &inputStatement{
-				statement: "SELECT 1",
-				delim:     delimiterHorizontal,
+				statement:                "SELECT 1",
+				statementWithoutComments: "SELECT 1",
+				delim:                    delimiterHorizontal,
 			},
 		},
 		{
 			desc:  "multi lines",
 			input: "SELECT\n* FROM\n t1\n;\n",
 			want: &inputStatement{
-				statement: "SELECT\n* FROM\n t1",
-				delim:     delimiterHorizontal,
+				statement:                "SELECT\n* FROM\n t1",
+				statementWithoutComments: "SELECT\n* FROM\n t1",
+				delim:                    delimiterHorizontal,
 			},
 		},
 		{
 			desc:  "multi lines with vertical delimiter",
 			input: "SELECT\n* FROM\n t1\\G\n",
 			want: &inputStatement{
-				statement: "SELECT\n* FROM\n t1",
-				delim:     delimiterVertical,
+				statement:                "SELECT\n* FROM\n t1",
+				statementWithoutComments: "SELECT\n* FROM\n t1",
+				delim:                    delimiterVertical,
 			},
 		},
 		{
 			desc:  "multi lines with multiple comments",
 			input: "SELECT\n/* comment */1,\n# comment\n2;\n",
 			want: &inputStatement{
-				statement: "SELECT\n1,\n2",
-				delim:     delimiterHorizontal,
+				statement:                "SELECT\n/* comment */1,\n# comment\n2",
+				statementWithoutComments: "SELECT\n 1,\n 2",
+				delim:                    delimiterHorizontal,
 			},
 		},
 		{
@@ -127,9 +169,9 @@ func TestReadInteractiveInput(t *testing.T) {
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
 			rl, err := readline.NewEx(&readline.Config{
-				Stdin:  ioutil.NopCloser(strings.NewReader(tt.input)),
-				Stdout: ioutil.Discard,
-				Stderr: ioutil.Discard,
+				Stdin:  io.NopCloser(strings.NewReader(tt.input)),
+				Stdout: io.Discard,
+				Stderr: io.Discard,
 			})
 			if err != nil {
 				t.Fatalf("unexpected readline.NewEx() error: %v", err)
@@ -152,8 +194,8 @@ func TestPrintResult(t *testing.T) {
 		result := &Result{
 			ColumnNames: []string{"foo", "bar"},
 			Rows: []Row{
-				Row{[]string{"1", "2"}},
-				Row{[]string{"3", "4"}},
+				{[]string{"1", "2"}},
+				{[]string{"3", "4"}},
 			},
 			IsMutation: false,
 		}
@@ -179,8 +221,8 @@ func TestPrintResult(t *testing.T) {
 		result := &Result{
 			ColumnNames: []string{"foo", "bar"},
 			Rows: []Row{
-				Row{[]string{"1", "2"}},
-				Row{[]string{"3", "4"}},
+				{[]string{"1", "2"}},
+				{[]string{"3", "4"}},
 			},
 			IsMutation: false,
 		}
@@ -206,8 +248,8 @@ bar: 4
 		result := &Result{
 			ColumnNames: []string{"foo", "bar"},
 			Rows: []Row{
-				Row{[]string{"1", "2"}},
-				Row{[]string{"3", "4"}},
+				{[]string{"1", "2"}},
+				{[]string{"3", "4"}},
 			},
 			IsMutation: false,
 		}

@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -29,11 +30,13 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	pb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/chzyer/readline"
 	"github.com/olekukonko/tablewriter"
 	"google.golang.org/api/option"
-	pb "google.golang.org/genproto/googleapis/spanner/v1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 )
 
 type DisplayMode int
@@ -58,15 +61,17 @@ var (
 )
 
 type Cli struct {
-	Session     *Session
-	Prompt      string
-	HistoryFile string
-	Credential  []byte
-	InStream    io.ReadCloser
-	OutStream   io.Writer
-	ErrStream   io.Writer
-	Verbose     bool
-	Priority    pb.RequestOptions_Priority
+	Session       *Session
+	Prompt        string
+	HistoryFile   string
+	Credential    []byte
+	InStream      io.ReadCloser
+	OutStream     io.Writer
+	ErrStream     io.Writer
+	Verbose       bool
+	Priority      pb.RequestOptions_Priority
+	Endpoint      string
+	SkipTLSVerify bool
 }
 
 type command struct {
@@ -74,8 +79,11 @@ type command struct {
 	Vertical bool
 }
 
-func NewCli(projectId, instanceId, databaseId, prompt, historyFile string, credential []byte, inStream io.ReadCloser, outStream io.Writer, errStream io.Writer, verbose bool, priority pb.RequestOptions_Priority) (*Cli, error) {
-	session, err := createSession(projectId, instanceId, databaseId, credential, priority)
+func NewCli(projectId, instanceId, databaseId, prompt, historyFile string, credential []byte,
+	inStream io.ReadCloser, outStream, errStream io.Writer, verbose bool,
+	priority pb.RequestOptions_Priority, role, endpoint string, directedRead *pb.DirectedReadOptions,
+	skipTLSVerify bool, protoDescriptor []byte) (*Cli, error) {
+	session, err := createSession(projectId, instanceId, databaseId, credential, priority, role, endpoint, directedRead, skipTLSVerify, protoDescriptor)
 	if err != nil {
 		return nil, err
 	}
@@ -89,14 +97,16 @@ func NewCli(projectId, instanceId, databaseId, prompt, historyFile string, crede
 	}
 
 	return &Cli{
-		Session:     session,
-		Prompt:      prompt,
-		HistoryFile: historyFile,
-		Credential:  credential,
-		InStream:    inStream,
-		OutStream:   outStream,
-		ErrStream:   errStream,
-		Verbose:     verbose,
+		Session:       session,
+		Prompt:        prompt,
+		HistoryFile:   historyFile,
+		Credential:    credential,
+		InStream:      inStream,
+		OutStream:     outStream,
+		ErrStream:     errStream,
+		Verbose:       verbose,
+		Endpoint:      endpoint,
+		SkipTLSVerify: skipTLSVerify,
 	}, nil
 }
 
@@ -135,7 +145,7 @@ func (c *Cli) RunInteractive() int {
 			continue
 		}
 
-		stmt, err := BuildStatement(input.statement)
+		stmt, err := BuildStatementWithComments(input.statementWithoutComments, input.statement)
 		if err != nil {
 			c.PrintInteractiveError(err)
 			continue
@@ -146,7 +156,8 @@ func (c *Cli) RunInteractive() int {
 		}
 
 		if s, ok := stmt.(*UseStatement); ok {
-			newSession, err := createSession(c.Session.projectId, c.Session.instanceId, s.Database, c.Credential, c.Priority)
+			newSession, err := createSession(c.Session.projectId, c.Session.instanceId, s.Database, c.Credential, c.Priority,
+				s.Role, c.Endpoint, c.Session.directedRead, c.SkipTLSVerify, c.Session.protoDescriptor)
 			if err != nil {
 				c.PrintInteractiveError(err)
 				continue
@@ -308,13 +319,21 @@ func (c *Cli) getInterpolatedPrompt() string {
 	return prompt
 }
 
-func createSession(projectId string, instanceId string, databaseId string, credential []byte, priority pb.RequestOptions_Priority) (*Session, error) {
+func createSession(projectId string, instanceId string, databaseId string, credential []byte,
+	priority pb.RequestOptions_Priority, role string, endpoint string, directedRead *pb.DirectedReadOptions,
+	skipTLSVerify bool, protoDescriptor []byte) (*Session, error) {
+	var opts []option.ClientOption
 	if credential != nil {
-		credentialOption := option.WithCredentialsJSON(credential)
-		return NewSession(projectId, instanceId, databaseId, priority, credentialOption)
-	} else {
-		return NewSession(projectId, instanceId, databaseId, priority)
+		opts = append(opts, option.WithCredentialsJSON(credential))
 	}
+	if endpoint != "" {
+		opts = append(opts, option.WithEndpoint(endpoint))
+	}
+	if skipTLSVerify {
+		creds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
+		opts = append(opts, option.WithGRPCDialOption(grpc.WithTransportCredentials(creds)))
+	}
+	return NewSession(projectId, instanceId, databaseId, priority, role, directedRead, protoDescriptor, opts...)
 }
 
 func readInteractiveInput(rl *readline.Instance, prompt string) (*inputStatement, error) {
@@ -358,11 +377,25 @@ func printResult(out io.Writer, result *Result, mode DisplayMode, interactive, v
 		table.SetAlignment(tablewriter.ALIGN_LEFT)
 		table.SetAutoWrapText(false)
 
+		var forceTableRender bool
+		// This condition is true if statement is SelectStatement or DmlStatement
+		if verbose && len(result.ColumnTypes) > 0 {
+			forceTableRender = true
+			var headers []string
+			for _, field := range result.ColumnTypes {
+				typename := formatTypeSimple(field.GetType())
+				headers = append(headers, field.GetName()+"\n"+typename)
+			}
+			table.SetHeader(headers)
+		} else {
+			table.SetHeader(result.ColumnNames)
+		}
+
 		for _, row := range result.Rows {
 			table.Append(row.Columns)
 		}
-		table.SetHeader(result.ColumnNames)
-		if len(result.Rows) > 0 {
+
+		if forceTableRender || len(result.Rows) > 0 {
 			table.Render()
 		}
 	} else if mode == DisplayModeVertical {
@@ -467,7 +500,12 @@ func buildCommands(input string) ([]*command, error) {
 	var cmds []*command
 	var pendingDdls []string
 	for _, separated := range separateInput(input) {
-		stmt, err := BuildStatement(separated.statement)
+		// Ignore the last empty statement
+		if separated.delim == delimiterUndefined && separated.statementWithoutComments == "" {
+			continue
+		}
+
+		stmt, err := BuildStatementWithComments(separated.statementWithoutComments, separated.statement)
 		if err != nil {
 			return nil, err
 		}

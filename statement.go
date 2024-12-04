@@ -26,9 +26,9 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	pb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"google.golang.org/api/iterator"
-	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
-	pb "google.golang.org/genproto/googleapis/spanner/v1"
 	"google.golang.org/grpc/codes"
 )
 
@@ -61,6 +61,9 @@ type Result struct {
 	Timestamp        time.Time
 	ForceVerbose     bool
 	CommitStats      *pb.CommitResponse_CommitStats
+
+	// ColumnTypes will be printed in `--verbose` mode if it is not empty
+	ColumnTypes []*pb.StructType_Field
 }
 
 type Row struct {
@@ -81,8 +84,10 @@ type QueryStats struct {
 }
 
 var (
-	// SQL
-	selectRe = regexp.MustCompile(`(?is)^(?:WITH|@{.+|SELECT)\s.+$`)
+	// Query
+	selectRe = regexp.MustCompile(`(?is)^(@{[^}]+}\s*)?(\(\s*)?(?:WITH|SELECT)\s.+$`)
+	graphRe  = regexp.MustCompile(`(?is)^GRAPH\s.+$`)
+	callRe   = regexp.MustCompile(`(?is)^CALL\s.+$`)
 
 	// DDL
 	createDatabaseRe = regexp.MustCompile(`(?is)^CREATE\s+DATABASE\s.+$`)
@@ -92,6 +97,7 @@ var (
 	grantRe          = regexp.MustCompile(`(?is)^GRANT\s.+$`)
 	revokeRe         = regexp.MustCompile(`(?is)^REVOKE\s.+$`)
 	alterRe          = regexp.MustCompile(`(?is)^ALTER\s.+$`)
+	renameRe         = regexp.MustCompile(`(?is)^RENAME\s.+$`)
 	truncateTableRe  = regexp.MustCompile(`(?is)^TRUNCATE\s+TABLE\s+(.+)$`)
 	analyzeRe        = regexp.MustCompile(`(?is)^ANALYZE$`)
 
@@ -112,58 +118,77 @@ var (
 
 	// Other
 	exitRe            = regexp.MustCompile(`(?is)^EXIT$`)
-	useRe             = regexp.MustCompile(`(?is)^USE\s+(.+)$`)
+	useRe             = regexp.MustCompile(`(?is)^USE\s+([^\s]+)(?:\s+ROLE\s+(.+))?$`)
 	showDatabasesRe   = regexp.MustCompile(`(?is)^SHOW\s+DATABASES$`)
 	showCreateTableRe = regexp.MustCompile(`(?is)^SHOW\s+CREATE\s+TABLE\s+(.+)$`)
-	showTablesRe      = regexp.MustCompile(`(?is)^SHOW\s+TABLES$`)
+	showTablesRe      = regexp.MustCompile(`(?is)^SHOW\s+TABLES(?:\s+(.+))?$`)
 	showColumnsRe     = regexp.MustCompile(`(?is)^(?:SHOW\s+COLUMNS\s+FROM)\s+(.+)$`)
 	showIndexRe       = regexp.MustCompile(`(?is)^SHOW\s+(?:INDEX|INDEXES|KEYS)\s+FROM\s+(.+)$`)
-	explainRe         = regexp.MustCompile(`(?is)^(?:EXPLAIN|DESC(?:RIBE)?)\s+(ANALYZE\s+)?(.+)$`)
+	explainRe         = regexp.MustCompile(`(?is)^EXPLAIN\s+(ANALYZE\s+)?(.+)$`)
+	describeRe        = regexp.MustCompile(`(?is)^DESCRIBE\s+(.+)$`)
 )
 
 var (
 	explainColumnNames        = []string{"ID", "Query_Execution_Plan"}
 	explainAnalyzeColumnNames = []string{"ID", "Query_Execution_Plan", "Rows_Returned", "Executions", "Total_Latency"}
+	describeColumnNames       = []string{"Column_Name", "Column_Type"}
 )
 
 func BuildStatement(input string) (Statement, error) {
+	return BuildStatementWithComments(input, input)
+}
+
+func BuildStatementWithComments(stripped, raw string) (Statement, error) {
 	switch {
-	case exitRe.MatchString(input):
+	case exitRe.MatchString(stripped):
 		return &ExitStatement{}, nil
-	case useRe.MatchString(input):
-		matched := useRe.FindStringSubmatch(input)
-		return &UseStatement{Database: unquoteIdentifier(matched[1])}, nil
-	case selectRe.MatchString(input):
-		return &SelectStatement{Query: input}, nil
-	case createDatabaseRe.MatchString(input):
-		return &CreateDatabaseStatement{CreateStatement: input}, nil
-	case createRe.MatchString(input):
-		return &DdlStatement{Ddl: input}, nil
-	case dropDatabaseRe.MatchString(input):
-		matched := dropDatabaseRe.FindStringSubmatch(input)
+	case useRe.MatchString(stripped):
+		matched := useRe.FindStringSubmatch(stripped)
+		return &UseStatement{Database: unquoteIdentifier(matched[1]), Role: unquoteIdentifier(matched[2])}, nil
+	case selectRe.MatchString(stripped), graphRe.MatchString(stripped), callRe.MatchString(stripped):
+		return &SelectStatement{Query: raw}, nil
+	case createDatabaseRe.MatchString(stripped):
+		return &CreateDatabaseStatement{CreateStatement: stripped}, nil
+	case createRe.MatchString(stripped):
+		return &DdlStatement{Ddl: stripped}, nil
+	case dropDatabaseRe.MatchString(stripped):
+		matched := dropDatabaseRe.FindStringSubmatch(stripped)
 		return &DropDatabaseStatement{DatabaseId: unquoteIdentifier(matched[1])}, nil
-	case dropRe.MatchString(input):
-		return &DdlStatement{Ddl: input}, nil
-	case alterRe.MatchString(input):
-		return &DdlStatement{Ddl: input}, nil
-	case grantRe.MatchString(input):
-		return &DdlStatement{Ddl: input}, nil
-	case revokeRe.MatchString(input):
-		return &DdlStatement{Ddl: input}, nil
-	case truncateTableRe.MatchString(input):
-		matched := truncateTableRe.FindStringSubmatch(input)
+	case dropRe.MatchString(stripped):
+		return &DdlStatement{Ddl: stripped}, nil
+	case alterRe.MatchString(stripped):
+		return &DdlStatement{Ddl: stripped}, nil
+	case renameRe.MatchString(stripped):
+		return &DdlStatement{Ddl: stripped}, nil
+	case grantRe.MatchString(stripped):
+		return &DdlStatement{Ddl: stripped}, nil
+	case revokeRe.MatchString(stripped):
+		return &DdlStatement{Ddl: stripped}, nil
+	case truncateTableRe.MatchString(stripped):
+		matched := truncateTableRe.FindStringSubmatch(stripped)
 		return &TruncateTableStatement{Table: unquoteIdentifier(matched[1])}, nil
-	case analyzeRe.MatchString(input):
-		return &DdlStatement{Ddl: input}, nil
-	case showDatabasesRe.MatchString(input):
+	case analyzeRe.MatchString(stripped):
+		return &DdlStatement{Ddl: stripped}, nil
+	case showDatabasesRe.MatchString(stripped):
 		return &ShowDatabasesStatement{}, nil
-	case showCreateTableRe.MatchString(input):
-		matched := showCreateTableRe.FindStringSubmatch(input)
-		return &ShowCreateTableStatement{Table: unquoteIdentifier(matched[1])}, nil
-	case showTablesRe.MatchString(input):
-		return &ShowTablesStatement{}, nil
-	case explainRe.MatchString(input):
-		matched := explainRe.FindStringSubmatch(input)
+	case showCreateTableRe.MatchString(stripped):
+		matched := showCreateTableRe.FindStringSubmatch(stripped)
+		schema, table := extractSchemaAndTable(unquoteIdentifier(matched[1]))
+		return &ShowCreateTableStatement{Schema: schema, Table: table}, nil
+	case showTablesRe.MatchString(stripped):
+		matched := showTablesRe.FindStringSubmatch(stripped)
+		return &ShowTablesStatement{Schema: unquoteIdentifier(matched[1])}, nil
+	case describeRe.MatchString(stripped):
+		matched := describeRe.FindStringSubmatch(stripped)
+		isDML := dmlRe.MatchString(matched[1])
+		switch {
+		case isDML:
+			return &DescribeStatement{Statement: matched[1], IsDML: true}, nil
+		default:
+			return &DescribeStatement{Statement: matched[1]}, nil
+		}
+	case explainRe.MatchString(stripped):
+		matched := explainRe.FindStringSubmatch(stripped)
 		isAnalyze := matched[1] != ""
 		isDML := dmlRe.MatchString(matched[2])
 		switch {
@@ -171,31 +196,31 @@ func BuildStatement(input string) (Statement, error) {
 			return &ExplainAnalyzeDmlStatement{Dml: matched[2]}, nil
 		case isAnalyze:
 			return &ExplainAnalyzeStatement{Query: matched[2]}, nil
-		case isDML:
-			return &ExplainDmlStatement{Dml: matched[2]}, nil
 		default:
-			return &ExplainStatement{Explain: matched[2]}, nil
+			return &ExplainStatement{Explain: matched[2], IsDML: isDML}, nil
 		}
-	case showColumnsRe.MatchString(input):
-		matched := showColumnsRe.FindStringSubmatch(input)
-		return &ShowColumnsStatement{Table: unquoteIdentifier(matched[1])}, nil
-	case showIndexRe.MatchString(input):
-		matched := showIndexRe.FindStringSubmatch(input)
-		return &ShowIndexStatement{Table: unquoteIdentifier(matched[1])}, nil
-	case dmlRe.MatchString(input):
-		return &DmlStatement{Dml: input}, nil
-	case pdmlRe.MatchString(input):
-		matched := pdmlRe.FindStringSubmatch(input)
+	case showColumnsRe.MatchString(stripped):
+		matched := showColumnsRe.FindStringSubmatch(stripped)
+		schema, table := extractSchemaAndTable(unquoteIdentifier(matched[1]))
+		return &ShowColumnsStatement{Schema: schema, Table: table}, nil
+	case showIndexRe.MatchString(stripped):
+		matched := showIndexRe.FindStringSubmatch(stripped)
+		schema, table := extractSchemaAndTable(unquoteIdentifier(matched[1]))
+		return &ShowIndexStatement{Schema: schema, Table: table}, nil
+	case dmlRe.MatchString(stripped):
+		return &DmlStatement{Dml: raw}, nil
+	case pdmlRe.MatchString(stripped):
+		matched := pdmlRe.FindStringSubmatch(stripped)
 		return &PartitionedDmlStatement{Dml: matched[1]}, nil
-	case beginRwRe.MatchString(input):
-		return newBeginRwStatement(input)
-	case beginRoRe.MatchString(input):
-		return newBeginRoStatement(input)
-	case commitRe.MatchString(input):
+	case beginRwRe.MatchString(stripped):
+		return newBeginRwStatement(stripped)
+	case beginRoRe.MatchString(stripped):
+		return newBeginRoStatement(stripped)
+	case commitRe.MatchString(stripped):
 		return &CommitStatement{}, nil
-	case rollbackRe.MatchString(input):
+	case rollbackRe.MatchString(stripped):
 		return &RollbackStatement{}, nil
-	case closeRe.MatchString(input):
+	case closeRe.MatchString(stripped):
 		return &CloseStatement{}, nil
 	}
 
@@ -203,7 +228,7 @@ func BuildStatement(input string) (Statement, error) {
 }
 
 func unquoteIdentifier(input string) string {
-	return strings.Trim(input, "`")
+	return strings.Trim(strings.TrimSpace(input), "`")
 }
 
 type SelectStatement struct {
@@ -229,6 +254,7 @@ func (s *SelectStatement) Execute(ctx context.Context, session *Session) (*Resul
 		ColumnNames: columnNames,
 		Rows:        rows,
 	}
+	result.ColumnTypes = iter.Metadata.GetRowType().GetFields()
 
 	queryStats := parseQueryStats(iter.QueryStats)
 	rowsReturned, err := strconv.Atoi(queryStats.RowsReturned)
@@ -247,11 +273,19 @@ func (s *SelectStatement) Execute(ctx context.Context, session *Session) (*Resul
 	return result, nil
 }
 
+// extractColumnNames extract column names from ResultSetMetadata.RowType.Fields.
+func extractColumnNames(fields []*pb.StructType_Field) []string {
+	var names []string
+	for _, field := range fields {
+		names = append(names, field.GetName())
+	}
+	return names
+}
+
 // parseQueryResult parses rows and columnNames from spanner.RowIterator.
 // A caller is responsible for calling iterator.Stop().
 func parseQueryResult(iter *spanner.RowIterator) ([]Row, []string, error) {
 	var rows []Row
-	var columnNames []string
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
@@ -259,10 +293,6 @@ func parseQueryResult(iter *spanner.RowIterator) ([]Row, []string, error) {
 		}
 		if err != nil {
 			return nil, nil, err
-		}
-
-		if len(columnNames) == 0 {
-			columnNames = row.ColumnNames()
 		}
 
 		columns, err := DecodeRow(row)
@@ -273,7 +303,7 @@ func parseQueryResult(iter *spanner.RowIterator) ([]Row, []string, error) {
 			Columns: columns,
 		})
 	}
-	return rows, columnNames, nil
+	return rows, extractColumnNames(iter.Metadata.GetRowType().GetFields()), nil
 }
 
 // parseQueryStats parses spanner.RowIterator.QueryStats.
@@ -378,6 +408,8 @@ func executeDdlStatements(ctx context.Context, session *Session, ddls []string) 
 	op, err := session.adminClient.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
 		Database:   session.DatabasePath(),
 		Statements: ddls,
+		// There is no problem to send ProtoDescriptors with any DDL statements
+		ProtoDescriptors: session.protoDescriptor,
 	})
 	if err != nil {
 		return nil, err
@@ -423,7 +455,8 @@ func (s *ShowDatabasesStatement) Execute(ctx context.Context, session *Session) 
 }
 
 type ShowCreateTableStatement struct {
-	Table string
+	Schema string
+	Table  string
 }
 
 func (s *ShowCreateTableStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
@@ -436,16 +469,23 @@ func (s *ShowCreateTableStatement) Execute(ctx context.Context, session *Session
 		return nil, err
 	}
 	for _, stmt := range ddlResponse.Statements {
-		if isCreateTableDDL(stmt, s.Table) {
+		if isCreateTableDDL(stmt, s.Schema, s.Table) {
+			var fqn string
+			if s.Schema == "" {
+				fqn = s.Table
+			} else {
+				fqn = fmt.Sprintf("%s.%s", s.Schema, s.Table)
+			}
+
 			resultRow := Row{
-				Columns: []string{s.Table, stmt},
+				Columns: []string{fqn, stmt},
 			}
 			result.Rows = append(result.Rows, resultRow)
 			break
 		}
 	}
 	if len(result.Rows) == 0 {
-		return nil, fmt.Errorf("table %q doesn't exist", s.Table)
+		return nil, fmt.Errorf("table %q doesn't exist in schema %q", s.Table, s.Schema)
 	}
 
 	result.AffectedRows = len(result.Rows)
@@ -453,13 +493,20 @@ func (s *ShowCreateTableStatement) Execute(ctx context.Context, session *Session
 	return result, nil
 }
 
-func isCreateTableDDL(ddl string, table string) bool {
+func isCreateTableDDL(ddl string, schema string, table string) bool {
 	table = regexp.QuoteMeta(table)
-	re := fmt.Sprintf("(?i)^CREATE TABLE (%s|`%s`)\\s*\\(", table, table)
+	var re string
+	if schema == "" {
+		re = fmt.Sprintf("(?i)^CREATE TABLE (%s|`%s`)\\s*\\(", table, table)
+	} else {
+		re = fmt.Sprintf("(?i)^CREATE TABLE (%s|`%s`)\\.(%s|`%s`)\\s*\\(", schema, schema, table, table)
+	}
 	return regexp.MustCompile(re).MatchString(ddl)
 }
 
-type ShowTablesStatement struct{}
+type ShowTablesStatement struct {
+	Schema string
+}
 
 func (s *ShowTablesStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
 	if session.InReadWriteTransaction() {
@@ -469,7 +516,8 @@ func (s *ShowTablesStatement) Execute(ctx context.Context, session *Session) (*R
 	}
 
 	alias := fmt.Sprintf("Tables_in_%s", session.databaseId)
-	stmt := spanner.NewStatement(fmt.Sprintf("SELECT t.TABLE_NAME AS `%s` FROM INFORMATION_SCHEMA.TABLES AS t WHERE t.TABLE_CATALOG = '' and t.TABLE_SCHEMA = ''", alias))
+	stmt := spanner.NewStatement(fmt.Sprintf("SELECT t.TABLE_NAME AS `%s` FROM INFORMATION_SCHEMA.TABLES AS t WHERE t.TABLE_CATALOG = '' and t.TABLE_SCHEMA = @schema", alias))
+	stmt.Params["schema"] = s.Schema
 
 	iter, _ := session.RunQuery(ctx, stmt)
 	defer iter.Stop()
@@ -488,13 +536,18 @@ func (s *ShowTablesStatement) Execute(ctx context.Context, session *Session) (*R
 
 type ExplainStatement struct {
 	Explain string
+	IsDML   bool
 }
 
+// Execute processes `EXPLAIN` statement for queries and DMLs.
 func (s *ExplainStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
-	stmt := spanner.NewStatement(s.Explain)
-	queryPlan, err := session.client.Single().AnalyzeQuery(ctx, stmt)
+	queryPlan, timestamp, _, err := runAnalyzeQuery(ctx, session, spanner.NewStatement(s.Explain), s.IsDML)
 	if err != nil {
 		return nil, err
+	}
+
+	if queryPlan == nil {
+		return nil, errors.New("EXPLAIN statement is not supported for Cloud Spanner Emulator.")
 	}
 
 	rows, predicates, err := processPlanWithoutStats(queryPlan)
@@ -504,12 +557,53 @@ func (s *ExplainStatement) Execute(ctx context.Context, session *Session) (*Resu
 
 	result := &Result{
 		ColumnNames:  explainColumnNames,
-		AffectedRows: 1,
+		AffectedRows: len(rows),
 		Rows:         rows,
+		Timestamp:    timestamp,
 		Predicates:   predicates,
 	}
 
 	return result, nil
+}
+
+type DescribeStatement struct {
+	Statement string
+	IsDML     bool
+}
+
+// Execute processes `DESCRIBE` statement for queries and DMLs.
+func (s *DescribeStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
+	_, timestamp, metadata, err := runAnalyzeQuery(ctx, session, spanner.NewStatement(s.Statement), s.IsDML)
+	if err != nil {
+		return nil, err
+	}
+
+	var rows []Row
+	for _, field := range metadata.GetRowType().GetFields() {
+		rows = append(rows, Row{Columns: []string{field.GetName(), formatTypeVerbose(field.GetType())}})
+	}
+
+	result := &Result{
+		AffectedRows: len(rows),
+		ColumnNames:  describeColumnNames,
+		Timestamp:    timestamp,
+		Rows:         rows,
+	}
+
+	return result, nil
+}
+
+func runAnalyzeQuery(ctx context.Context, session *Session, stmt spanner.Statement, isDML bool) (queryPlan *pb.QueryPlan, commitTimestamp time.Time, metadata *pb.ResultSetMetadata, err error) {
+	if !isDML {
+		queryPlan, metadata, err := session.RunAnalyzeQuery(ctx, stmt)
+		return queryPlan, time.Time{}, metadata, err
+	}
+
+	_, timestamp, queryPlan, metadata, err := runInNewOrExistRwTxForExplain(ctx, session, func() (int64, *pb.QueryPlan, *pb.ResultSetMetadata, error) {
+		plan, metadata, err := session.RunAnalyzeQuery(ctx, stmt)
+		return 0, plan, metadata, err
+	})
+	return queryPlan, timestamp, metadata, err
 }
 
 type ExplainAnalyzeStatement struct {
@@ -609,7 +703,8 @@ func processPlanImpl(plan *pb.QueryPlan, withStats bool) (rows []Row, predicates
 }
 
 type ShowColumnsStatement struct {
-	Table string
+	Schema string
+	Table  string
 }
 
 func (s *ShowColumnsStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
@@ -635,10 +730,10 @@ LEFT JOIN
 LEFT JOIN
   INFORMATION_SCHEMA.COLUMN_OPTIONS CO USING(TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME)
 WHERE
-  C.TABLE_SCHEMA = '' AND LOWER(C.TABLE_NAME) = LOWER(@table_name)
+  LOWER(C.TABLE_SCHEMA) = LOWER(@table_schema) AND LOWER(C.TABLE_NAME) = LOWER(@table_name)
 ORDER BY
   C.ORDINAL_POSITION ASC`,
-		Params: map[string]interface{}{"table_name": s.Table}}
+		Params: map[string]interface{}{"table_name": s.Table, "table_schema": s.Schema}}
 
 	iter, _ := session.RunQuery(ctx, stmt)
 	defer iter.Stop()
@@ -648,7 +743,7 @@ ORDER BY
 		return nil, err
 	}
 	if len(rows) == 0 {
-		return nil, fmt.Errorf("table %q doesn't exist", s.Table)
+		return nil, fmt.Errorf("table %q doesn't exist in schema %q", s.Table, s.Schema)
 	}
 
 	return &Result{
@@ -658,8 +753,17 @@ ORDER BY
 	}, nil
 }
 
+func extractSchemaAndTable(s string) (string, string) {
+	schema, table, found := strings.Cut(s, ".")
+	if !found {
+		return "", unquoteIdentifier(s)
+	}
+	return unquoteIdentifier(schema), unquoteIdentifier(table)
+}
+
 type ShowIndexStatement struct {
-	Table string
+	Schema string
+	Table  string
 }
 
 func (s *ShowIndexStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
@@ -681,8 +785,8 @@ func (s *ShowIndexStatement) Execute(ctx context.Context, session *Session) (*Re
 FROM
   INFORMATION_SCHEMA.INDEXES I
 WHERE
-  I.TABLE_SCHEMA = '' AND LOWER(TABLE_NAME) = LOWER(@table_name)`,
-		Params: map[string]interface{}{"table_name": s.Table}}
+  LOWER(I.TABLE_SCHEMA) = @table_schema AND LOWER(TABLE_NAME) = LOWER(@table_name)`,
+		Params: map[string]interface{}{"table_name": s.Table, "table_schema": s.Schema}}
 
 	iter, _ := session.RunQuery(ctx, stmt)
 	defer iter.Stop()
@@ -692,7 +796,7 @@ WHERE
 		return nil, err
 	}
 	if len(rows) == 0 {
-		return nil, fmt.Errorf("table %q doesn't exist", s.Table)
+		return nil, fmt.Errorf("table %q doesn't exist in schema %q", s.Table, s.Schema)
 	}
 
 	return &Result{
@@ -739,10 +843,13 @@ func (s *DmlStatement) Execute(ctx context.Context, session *Session) (*Result, 
 
 	result := &Result{IsMutation: true}
 
+	var rows []Row
+	var columnNames []string
 	var numRows int64
+	var metadata *pb.ResultSetMetadata
 	var err error
 	if session.InReadWriteTransaction() {
-		numRows, err = session.RunUpdate(ctx, stmt)
+		rows, columnNames, numRows, metadata, err = session.RunUpdate(ctx, stmt, false)
 		if err != nil {
 			// Need to call rollback to free the acquired session in underlying google-cloud-go/spanner.
 			rollback := &RollbackStatement{}
@@ -756,7 +863,7 @@ func (s *DmlStatement) Execute(ctx context.Context, session *Session) (*Result, 
 			return nil, err
 		}
 
-		numRows, err = session.RunUpdate(ctx, stmt)
+		rows, columnNames, numRows, metadata, err = session.RunUpdate(ctx, stmt, false)
 		if err != nil {
 			// once error has happened, escape from implicit transaction
 			rollback := &RollbackStatement{}
@@ -773,6 +880,9 @@ func (s *DmlStatement) Execute(ctx context.Context, session *Session) (*Result, 
 		result.CommitStats = txnResult.CommitStats
 	}
 
+	result.ColumnTypes = metadata.GetRowType().GetFields()
+	result.Rows = rows
+	result.ColumnNames = columnNames
 	result.AffectedRows = int(numRows)
 
 	return result, nil
@@ -807,35 +917,6 @@ func (s *PartitionedDmlStatement) Execute(ctx context.Context, session *Session)
 	}, nil
 }
 
-type ExplainDmlStatement struct {
-	Dml string
-}
-
-func (s *ExplainDmlStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
-	_, timestamp, queryPlan, err := runInNewOrExistRwTxForExplain(ctx, session, func() (int64, *pb.QueryPlan, error) {
-		plan, err := session.RunAnalyzeQuery(ctx, spanner.NewStatement(s.Dml))
-		return 0, plan, err
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	rows, predicates, err := processPlanWithoutStats(queryPlan)
-	if err != nil {
-		return nil, err
-	}
-	result := &Result{
-		IsMutation:   true,
-		ColumnNames:  explainColumnNames,
-		AffectedRows: 0,
-		Rows:         rows,
-		Predicates:   predicates,
-		Timestamp:    timestamp,
-	}
-
-	return result, nil
-}
-
 type ExplainAnalyzeDmlStatement struct {
 	Dml string
 }
@@ -843,14 +924,14 @@ type ExplainAnalyzeDmlStatement struct {
 func (s *ExplainAnalyzeDmlStatement) Execute(ctx context.Context, session *Session) (*Result, error) {
 	stmt := spanner.NewStatement(s.Dml)
 
-	affectedRows, timestamp, queryPlan, err := runInNewOrExistRwTxForExplain(ctx, session, func() (int64, *pb.QueryPlan, error) {
+	affectedRows, timestamp, queryPlan, _, err := runInNewOrExistRwTxForExplain(ctx, session, func() (int64, *pb.QueryPlan, *pb.ResultSetMetadata, error) {
 		iter, _ := session.RunQueryWithStats(ctx, stmt)
 		defer iter.Stop()
 		err := iter.Do(func(r *spanner.Row) error { return nil })
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
-		return iter.RowCount, iter.QueryPlan, nil
+		return iter.RowCount, iter.QueryPlan, iter.Metadata, nil
 	})
 	if err != nil {
 		return nil, err
@@ -873,39 +954,39 @@ func (s *ExplainAnalyzeDmlStatement) Execute(ctx context.Context, session *Sessi
 	return result, nil
 }
 
-// runInNewOrExistRwTxForExplain is a helper function for ExplainDmlStatement and ExplainAnalyzeDmlStatement.
+// runInNewOrExistRwTxForExplain is a helper function for runAnalyzeQuery and ExplainAnalyzeDmlStatement.
 // It execute a function in the current RW transaction or an implicit RW transaction.
-func runInNewOrExistRwTxForExplain(ctx context.Context, session *Session, f func() (affected int64, plan *pb.QueryPlan, err error)) (affected int64, ts time.Time, plan *pb.QueryPlan, err error) {
+func runInNewOrExistRwTxForExplain(ctx context.Context, session *Session, f func() (affected int64, plan *pb.QueryPlan, metadata *pb.ResultSetMetadata, err error)) (affected int64, ts time.Time, plan *pb.QueryPlan, metadata *pb.ResultSetMetadata, err error) {
 	if session.InReadWriteTransaction() {
-		affected, plan, err := f()
+		affected, plan, metadata, err := f()
 		if err != nil {
 			// Need to call rollback to free the acquired session in underlying google-cloud-go/spanner.
 			rollback := &RollbackStatement{}
 			rollback.Execute(ctx, session)
-			return 0, time.Time{}, nil, fmt.Errorf("transaction was aborted: %v", err)
+			return 0, time.Time{}, nil, nil, fmt.Errorf("transaction was aborted: %v", err)
 		}
-		return affected, time.Time{}, plan, nil
+		return affected, time.Time{}, plan, metadata, nil
 	} else {
 		// Start implicit transaction.
 		begin := BeginRwStatement{}
 		if _, err := begin.Execute(ctx, session); err != nil {
-			return 0, time.Time{}, nil, err
+			return 0, time.Time{}, nil, nil, err
 		}
 
-		affected, plan, err := f()
+		affected, plan, metadata, err := f()
 		if err != nil {
 			// once error has happened, escape from implicit transaction
 			rollback := &RollbackStatement{}
 			rollback.Execute(ctx, session)
-			return 0, time.Time{}, nil, err
+			return 0, time.Time{}, nil, nil, err
 		}
 
 		commit := CommitStatement{}
 		txnResult, err := commit.Execute(ctx, session)
 		if err != nil {
-			return 0, time.Time{}, nil, err
+			return 0, time.Time{}, nil, nil, err
 		}
-		return affected, txnResult.Timestamp, plan, nil
+		return affected, txnResult.Timestamp, plan, metadata, nil
 	}
 }
 
@@ -1093,6 +1174,7 @@ type ExitStatement struct {
 
 type UseStatement struct {
 	Database string
+	Role     string
 	NopStatement
 }
 
