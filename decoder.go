@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 )
 
 func DecodeRow(row *spanner.Row) ([]string, error) {
@@ -59,7 +59,7 @@ func DecodeColumn(column spanner.GenericColumnValue) (string, error) {
 			for _, v := range vs {
 				decoded = append(decoded, nullBoolToString(v))
 			}
-		case sppb.TypeCode_BYTES:
+		case sppb.TypeCode_BYTES, sppb.TypeCode_PROTO:
 			var vs [][]byte
 			if err := column.Decode(&vs); err != nil {
 				return "", err
@@ -69,6 +69,17 @@ func DecodeColumn(column spanner.GenericColumnValue) (string, error) {
 			}
 			for _, v := range vs {
 				decoded = append(decoded, nullBytesToString(v))
+			}
+		case sppb.TypeCode_FLOAT32:
+			var vs []spanner.NullFloat32
+			if err := column.Decode(&vs); err != nil {
+				return "", err
+			}
+			if vs == nil {
+				return "NULL", nil
+			}
+			for _, v := range vs {
+				decoded = append(decoded, nullFloat32ToString(v))
 			}
 		case sppb.TypeCode_FLOAT64:
 			var vs []spanner.NullFloat64
@@ -81,7 +92,7 @@ func DecodeColumn(column spanner.GenericColumnValue) (string, error) {
 			for _, v := range vs {
 				decoded = append(decoded, nullFloat64ToString(v))
 			}
-		case sppb.TypeCode_INT64:
+		case sppb.TypeCode_INT64, sppb.TypeCode_ENUM:
 			var vs []spanner.NullInt64
 			if err := column.Decode(&vs); err != nil {
 				return "", err
@@ -172,19 +183,25 @@ func DecodeColumn(column spanner.GenericColumnValue) (string, error) {
 			return "", err
 		}
 		return nullBoolToString(v), nil
-	case sppb.TypeCode_BYTES:
+	case sppb.TypeCode_BYTES, sppb.TypeCode_PROTO:
 		var v []byte
 		if err := column.Decode(&v); err != nil {
 			return "", err
 		}
 		return nullBytesToString(v), nil
+	case sppb.TypeCode_FLOAT32:
+		var v spanner.NullFloat32
+		if err := column.Decode(&v); err != nil {
+			return "", err
+		}
+		return nullFloat32ToString(v), nil
 	case sppb.TypeCode_FLOAT64:
 		var v spanner.NullFloat64
 		if err := column.Decode(&v); err != nil {
 			return "", err
 		}
 		return nullFloat64ToString(v), nil
-	case sppb.TypeCode_INT64:
+	case sppb.TypeCode_INT64, sppb.TypeCode_ENUM:
 		var v spanner.NullInt64
 		if err := column.Decode(&v); err != nil {
 			return "", err
@@ -236,6 +253,14 @@ func nullBoolToString(v spanner.NullBool) string {
 func nullBytesToString(v []byte) string {
 	if v != nil {
 		return base64.StdEncoding.EncodeToString(v)
+	} else {
+		return "NULL"
+	}
+}
+
+func nullFloat32ToString(v spanner.NullFloat32) string {
+	if v.Valid {
+		return fmt.Sprintf("%f", v.Float32)
 	} else {
 		return "NULL"
 	}
@@ -296,5 +321,43 @@ func nullJSONToString(v spanner.NullJSON) string {
 		return v.String()
 	} else {
 		return "NULL"
+	}
+}
+
+func formatTypeSimple(typ *sppb.Type) string {
+	switch code := typ.GetCode(); code {
+	case sppb.TypeCode_ARRAY:
+		return fmt.Sprintf("ARRAY<%v>", formatTypeSimple(typ.GetArrayElementType()))
+	default:
+		if name, ok := sppb.TypeCode_name[int32(code)]; ok {
+			return name
+		} else {
+			return "UNKNOWN"
+		}
+	}
+}
+
+func formatTypeVerbose(typ *sppb.Type) string {
+	switch code := typ.GetCode(); code {
+	case sppb.TypeCode_ARRAY:
+		return fmt.Sprintf("ARRAY<%v>", formatTypeVerbose(typ.GetArrayElementType()))
+	case sppb.TypeCode_ENUM, sppb.TypeCode_PROTO:
+		return typ.GetProtoTypeFqn()
+	case sppb.TypeCode_STRUCT:
+		var structTypeStrs []string
+		for _, v := range typ.GetStructType().GetFields() {
+			if v.GetName() != "" {
+				structTypeStrs = append(structTypeStrs, fmt.Sprintf("%v %v", v.GetName(), formatTypeVerbose(v.GetType())))
+			} else {
+				structTypeStrs = append(structTypeStrs, fmt.Sprintf("%v", formatTypeVerbose(v.GetType())))
+			}
+		}
+		return fmt.Sprintf("STRUCT<%v>", strings.Join(structTypeStrs, ", "))
+	default:
+		if name, ok := sppb.TypeCode_name[int32(code)]; ok {
+			return name
+		} else {
+			return "UNKNOWN"
+		}
 	}
 }

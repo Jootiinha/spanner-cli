@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"google.golang.org/protobuf/testing/protocmp"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -31,8 +32,8 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
-	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
-	pb "google.golang.org/genproto/googleapis/spanner/v1"
+	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	pb "cloud.google.com/go/spanner/apiv1/spannerpb"
 )
 
 const (
@@ -85,7 +86,7 @@ func setup(t *testing.T, ctx context.Context, dmls []string) (*Session, string, 
 	if testCredential != "" {
 		options = append(options, option.WithCredentialsJSON([]byte(testCredential)))
 	}
-	session, err := NewSession(testProjectId, testInstanceId, testDatabaseId, pb.RequestOptions_PRIORITY_UNSPECIFIED, options...)
+	session, err := NewSession(testProjectId, testInstanceId, testDatabaseId, pb.RequestOptions_PRIORITY_UNSPECIFIED, "", nil, nil, options...)
 	if err != nil {
 		t.Fatalf("failed to create test session: err=%s", err)
 	}
@@ -142,11 +143,13 @@ func setup(t *testing.T, ctx context.Context, dmls []string) (*Session, string, 
 }
 
 func compareResult(t *testing.T, got *Result, expected *Result) {
+	t.Helper()
 	opts := []cmp.Option{
 		cmpopts.IgnoreFields(Result{}, "Stats"),
 		cmpopts.IgnoreFields(Result{}, "Timestamp"),
 		// Commit Stats is only provided by real instances
 		cmpopts.IgnoreFields(Result{}, "CommitStats"),
+		protocmp.Transform(),
 	}
 	if !cmp.Equal(got, expected, opts...) {
 		t.Errorf("diff: %s", cmp.Diff(got, expected, opts...))
@@ -183,7 +186,11 @@ func TestSelect(t *testing.T) {
 			Row{[]string{"2", "false"}},
 		},
 		AffectedRows: 2,
-		IsMutation:   false,
+		ColumnTypes: []*pb.StructType_Field{
+			{Name: "id", Type: &pb.Type{Code: pb.TypeCode_INT64}},
+			{Name: "active", Type: &pb.Type{Code: pb.TypeCode_BOOL}},
+		},
+		IsMutation: false,
 	})
 }
 
@@ -481,6 +488,11 @@ func TestReadOnlyTransaction(t *testing.T) {
 				Row{[]string{"1", "true"}},
 				Row{[]string{"2", "false"}},
 			},
+
+			ColumnTypes: []*pb.StructType_Field{
+				{Name: "id", Type: &pb.Type{Code: pb.TypeCode_INT64}},
+				{Name: "active", Type: &pb.Type{Code: pb.TypeCode_BOOL}},
+			},
 			AffectedRows: 2,
 			IsMutation:   false,
 		})
@@ -551,6 +563,10 @@ func TestReadOnlyTransaction(t *testing.T) {
 			Rows: []Row{
 				Row{[]string{"1", "true"}},
 				Row{[]string{"2", "false"}},
+			},
+			ColumnTypes: []*pb.StructType_Field{
+				{Name: "id", Type: &pb.Type{Code: pb.TypeCode_INT64}},
+				{Name: "active", Type: &pb.Type{Code: pb.TypeCode_BOOL}},
 			},
 			AffectedRows: 2,
 			IsMutation:   false,
